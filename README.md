@@ -4,6 +4,8 @@ Network topology mapper with a rich terminal UI. Give it a hostname or IP — it
 
 Built with Go, [Bubble Tea](https://github.com/charmbracelet/bubbletea), and [Lip Gloss](https://github.com/charmbracelet/lipgloss).
 
+![netmap demo](demo.gif)
+
 ## Install
 
 ```bash
