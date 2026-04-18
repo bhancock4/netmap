@@ -38,6 +38,7 @@ brews:
   - repository:
       owner: bhancock4
       name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     homepage: "https://github.com/bhancock4/netmap"
     description: "Network topology mapper with a rich terminal UI"
     license: "MIT"
