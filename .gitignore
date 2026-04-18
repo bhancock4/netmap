@@ -1,0 +1,5 @@
+netmap
+netmap_race
+*.yaml
+!.goreleaser.yaml
+dist/
