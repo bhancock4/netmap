@@ -41,6 +41,18 @@ func New(cfg model.Config) *Scanner {
 func (s *Scanner) Run(ctx context.Context) {
 	target := s.Config.Target
 
+	// Check for CIDR notation (subnet scan)
+	if strings.Contains(target, "/") {
+		_, _, err := net.ParseCIDR(target)
+		if err == nil {
+			s.Config.Target = target
+			SubnetScan(ctx, s, target)
+			s.emit(model.EventScanDone, "", "Subnet scan complete")
+			close(s.Events)
+			return
+		}
+	}
+
 	isIP := net.ParseIP(target) != nil
 
 	target = strings.TrimPrefix(target, "https://")

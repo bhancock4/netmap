@@ -1,0 +1,2 @@
+- [No plugin system](feedback_no_plugins.md) — User declined plugin probes, keep everything built-in
+- [Sound must be toggleable](feedback_sound_toggle.md) — Sound effects need on/off toggle, default off

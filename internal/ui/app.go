@@ -20,6 +20,7 @@ type viewMode int
 const (
 	viewTree viewMode = iota
 	viewPath
+	viewGraph
 )
 
 // scanEventMsg wraps a scanner event for the bubbletea event loop.
@@ -64,9 +65,13 @@ type Model struct {
 	pathCursor   int // cursor position in path view
 	inputMode    bool   // true when typing a new target
 	inputBuffer  string // the text being typed
-	OutputFile   string
-	Format       export.Format
-	cancelScan   context.CancelFunc
+	OutputFile    string
+	Format        export.Format
+	WatchMode     bool
+	WatchInterval time.Duration
+	watchNext     time.Time     // when the next rescan fires
+	sound         *Sound
+	cancelScan    context.CancelFunc
 }
 
 // New creates a new UI model.
@@ -81,12 +86,20 @@ func New(s *scanner.Scanner) Model {
 		statusMsg: "Starting scan...",
 		Format:    export.FormatYAML,
 		mode:      viewTree,
+		sound:     NewSound(),
 	}
 }
 
 // SetCancel sets the cancel function for the current scan context.
 func (m *Model) SetCancel(cancel context.CancelFunc) {
 	m.cancelScan = cancel
+}
+
+// SetSound enables sound from the start (--sound flag).
+func (m *Model) SetSound(on bool) {
+	if on {
+		m.sound.enabled = true
+	}
 }
 
 func (m Model) Init() tea.Cmd {
@@ -134,6 +147,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Path view keys
 		if m.mode == viewPath {
 			return m.updatePathView(msg)
+		}
+
+		// Graph view keys
+		if m.mode == viewGraph {
+			switch msg.String() {
+			case "q", "ctrl+c":
+				return m, tea.Quit
+			case "t", "escape", "v":
+				m.mode = viewTree
+			case "?":
+				m.showHelp = true
+			}
+			return m, nil
 		}
 
 		// Tree view keys
@@ -199,6 +225,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, m.startDeepScan(nodeID)
 				}
 			}
+		case "t":
+			// Switch to topology graph view
+			m.mode = viewGraph
 		case "v":
 			// Switch to path view
 			if m.cursor < len(m.flatTree) {
@@ -208,6 +237,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if len(path) > 0 {
 					m.pathCursor = len(path) - 1 // start at the target
 				}
+			}
+		case "m":
+			// Toggle sound
+			on := m.sound.Toggle()
+			if on {
+				m.statusMsg = StyleSuccess.Render("♪") + " Sound on"
+				m.sound.Play(SoundNodeDiscovered)
+			} else {
+				m.statusMsg = StyleDim.Render("♪") + " Sound off"
 			}
 		case "n":
 			// New target
@@ -233,6 +271,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		m.spinFrame = (m.spinFrame + 1) % 10000
 		m.rebuildTree()
+
+		// Watch mode: auto-rescan when interval elapses
+		if m.WatchMode && !m.scanning && !m.deepScanning && !m.watchNext.IsZero() && time.Now().After(m.watchNext) {
+			m.watchNext = time.Time{} // clear to prevent double-trigger
+			return m, m.startRescan()
+		}
+
 		return m, m.tickCmd()
 
 	case scanEventMsg:
@@ -240,16 +285,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.events = append(m.events, event)
 		m.statusMsg = event.Message
 
+		if event.Type == model.EventNodeAdded {
+			m.sound.Play(SoundNodeDiscovered)
+		}
+
 		if event.Type == model.EventScanDone {
+			m.sound.Play(SoundScanComplete)
 			m.scanning = false
+			elapsed := time.Since(m.startTime).Round(time.Millisecond)
 			m.statusMsg = fmt.Sprintf("Scan complete — %d nodes discovered in %s",
-				m.graph.NodeCount(), time.Since(m.startTime).Round(time.Millisecond))
+				m.graph.NodeCount(), elapsed)
+			if m.WatchMode {
+				m.watchNext = time.Now().Add(m.WatchInterval)
+				m.statusMsg += fmt.Sprintf(" │ next scan in %s", m.WatchInterval)
+			}
 			if m.OutputFile != "" {
 				return m, m.saveToFile(m.OutputFile)
 			}
 		}
 
 		if event.Type == model.EventDeepDone {
+			m.sound.Play(SoundDeepScanComplete)
 			m.deepScanning = false
 			m.deepNodeID = ""
 			m.statusMsg = StyleDeepScan.Render("⬢") + " " + event.Message
@@ -532,12 +588,16 @@ func (m Model) View() string {
 	statusHeight := 1
 	mainHeight := max(m.height-headerHeight-statusHeight, 10)
 
-	if m.mode == viewPath {
+	if m.mode == viewGraph {
+		// Topology graph view: full width
+		graphView := m.renderGraphView(m.width-2, mainHeight)
+		graphView = lipgloss.NewStyle().Height(mainHeight).MaxHeight(mainHeight).Render(graphView)
+		sections = append(sections, graphView)
+	} else if m.mode == viewPath {
 		// Path view: size path to content, give the rest to detail
 		path := m.buildPath()
 		nodesPerRow := max((m.width-4-4)/(16+8+2), 2)
 		pathRows := (len(path) + nodesPerRow - 1) / nodesPerRow
-		// Each row of boxes is ~6 lines, connectors between rows ~3, plus header/legend/hint ~5
 		pathContentHeight := pathRows*6 + max(pathRows-1, 0)*3 + 7
 		pathHeight := min(pathContentHeight, mainHeight/2)
 		detailHeight := mainHeight - pathHeight
@@ -596,6 +656,7 @@ func (m Model) renderHelp() string {
 		StyleSubtitle.Render("  Actions"),
 		divider,
 		helpLine("d", "Deep scan selected node"),
+		helpLine("m", "Toggle sound effects"),
 		helpLine("n", "New target (enter address)"),
 		helpLine("esc", "Abort running scan"),
 		helpLine("r", "Rescan current target"),
@@ -998,18 +1059,33 @@ func (m Model) renderStatusBar() string {
 	nodeCount := fmt.Sprintf("%d nodes", m.graph.NodeCount())
 	elapsed := time.Since(m.startTime).Round(time.Second).String()
 
+	// Watch mode countdown
+	watchInfo := ""
+	if m.WatchMode && !m.watchNext.IsZero() && !m.scanning {
+		remaining := time.Until(m.watchNext).Round(time.Second)
+		if remaining > 0 {
+			watchInfo = fmt.Sprintf("│ rescan in %s ", remaining)
+		}
+	}
+
 	var hints string
-	if m.mode == viewPath {
+	if m.mode == viewGraph {
+		hints = "t return to tree │ ? help │ q quit"
+	} else if m.mode == viewPath {
 		hints = "◄► traverse │ ↑↓ scroll detail │ d deep │ v tree view │ ? help │ q quit"
 	} else if m.scanning {
 		hints = "↑↓ navigate │ esc abort │ ? help │ q quit"
 	} else if m.deepScanning {
 		hints = "↑↓ navigate │ v path │ ? help │ q quit"
+	} else if m.WatchMode {
+		hints = "↑↓ nav │ enter fold │ d deep │ v path │ s save │ ? help │ q quit"
 	} else {
-		hints = "↑↓ nav │ enter fold │ d deep │ v path │ n new │ r rescan │ s save │ ? help │ q quit"
+		hints = "↑↓ nav │ enter fold │ d deep │ v path │ t topo │ n new │ r rescan │ s save │ ? help │ q quit"
 	}
 
-	right := StyleDim.Render(fmt.Sprintf("%s │ %s │ %s", nodeCount, elapsed, hints))
+	_ = watchInfo
+
+	right := StyleDim.Render(fmt.Sprintf("%s │ %s %s│ %s", nodeCount, elapsed, watchInfo, hints))
 
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 0 {

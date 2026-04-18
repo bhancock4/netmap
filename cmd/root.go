@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -22,6 +23,8 @@ var (
 	outputFile string
 	format     string
 	headless   bool
+	saveName   string
+	soundOn    bool
 )
 
 var rootCmd = &cobra.Command{
@@ -78,7 +81,15 @@ Press ? inside the TUI for a full keybinding reference.`,
 		m := ui.New(s)
 		m.SetCancel(cancel)
 		m.OutputFile = outputFile
+		if saveName != "" {
+			ext := "yaml"
+			if exportFormat == export.FormatJSON {
+				ext = "json"
+			}
+			m.OutputFile = filepath.Join(sessionsDir(), saveName+"."+ext)
+		}
 		m.Format = exportFormat
+		m.SetSound(soundOn)
 		p := tea.NewProgram(m, tea.WithAltScreen())
 
 		if _, err := p.Run(); err != nil {
@@ -112,6 +123,19 @@ func runHeadless(s *scanner.Scanner, format export.Format) error {
 		return err
 	}
 
+	// Save session if requested
+	if saveName != "" {
+		ext := "yaml"
+		if format == export.FormatJSON {
+			ext = "json"
+		}
+		sessPath := filepath.Join(sessionsDir(), saveName+"."+ext)
+		if err := os.WriteFile(sessPath, data, 0644); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "Session saved to %s\n", sessPath)
+	}
+
 	if outputFile != "" {
 		if err := os.WriteFile(outputFile, data, 0644); err != nil {
 			return err
@@ -131,6 +155,8 @@ func init() {
 	rootCmd.Flags().StringVarP(&outputFile, "output", "o", "", "Write results to file")
 	rootCmd.Flags().StringVarP(&format, "format", "f", "yaml", "Export format: yaml or json")
 	rootCmd.Flags().BoolVar(&headless, "headless", false, "Run without TUI, output to stdout (for piping/scripts)")
+	rootCmd.Flags().StringVar(&saveName, "save", "", "Save session to ~/.netmap/sessions/<name>")
+	rootCmd.Flags().BoolVar(&soundOn, "sound", false, "Enable sound effects (toggle with 'm' in TUI)")
 }
 
 // Execute runs the root command.
