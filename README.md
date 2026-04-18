@@ -45,7 +45,7 @@ Press `v` on any node to see the route from your machine to that node, rendered 
 ```
 ╔══════╗        ╭────────╮        ╭────────╮        ╔══════════╗
 ║  ⌂   ║──────▶│   ◇    │──────▶│   ◇    │──────▶║    ◆     ║
-║ YOU  ║        │10.0.0.1│        │72.14.2.│        ║google.com║
+║ YOU  ║        │10.0.0.1│        │72.14.2.│        ║ target  ║
 ╚══════╝        ╰────────╯        ╰────────╯        ╚══════════╝
                    2ms               15ms               45ms
 ```
@@ -112,16 +112,16 @@ Flags:
 # Press 's' during a scan — writes netmap_<target>_<timestamp>.yaml
 
 # Headless YAML to stdout
-netmap cloudflare.com --headless
+netmap example.com --headless
 
 # Headless JSON piped to jq
-netmap google.com --headless -f json | jq '.nodes[] | select(.type == "IP") | .label'
+netmap example.com --headless -f json | jq '.nodes[] | select(.type == "IP") | .label'
 
 # Auto-save to file with TUI
-netmap github.com -o scan.yaml
+netmap example.com -o scan.yaml
 
 # Cron job
-netmap myserver.com --headless -t 2m -o /var/log/netmap/$(date +%F).yaml
+netmap example.com --headless -t 2m -o /var/log/netmap/$(date +%F).yaml
 ```
 
 ## Man Page
