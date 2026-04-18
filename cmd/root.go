@@ -106,9 +106,17 @@ func runHeadless(s *scanner.Scanner, format export.Format) error {
 	ctx, cancel := context.WithTimeout(context.Background(), s.Config.Timeout)
 	defer cancel()
 
-	// Drain events in background
+	// Drain events in background (non-blocking)
 	go func() {
-		for range s.Events {
+		for {
+			select {
+			case _, ok := <-s.Events:
+				if !ok {
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 

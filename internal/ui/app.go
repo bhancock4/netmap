@@ -40,6 +40,12 @@ type deepScanDoneMsg struct {
 	nodeID string
 }
 
+// subnetSweepDoneMsg is sent when an inline subnet sweep finishes.
+type subnetSweepDoneMsg struct {
+	cidr  string
+	found int
+}
+
 // Model is the main bubbletea model.
 type Model struct {
 	graph        *model.Graph
@@ -166,11 +172,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
-		case "escape":
-			if m.scanning && m.cancelScan != nil {
+		case "escape", "esc":
+			if m.cancelScan != nil {
 				m.cancelScan()
+			}
+			if m.scanning || m.deepScanning {
 				m.scanning = false
-				m.statusMsg = fmt.Sprintf("Scan aborted — %d nodes discovered in %s",
+				m.deepScanning = false
+				m.deepNodeID = ""
+				m.statusMsg = fmt.Sprintf("Aborted — %d nodes discovered in %s",
 					m.graph.NodeCount(), time.Since(m.startTime).Round(time.Millisecond))
 			}
 		case "?":
@@ -210,6 +220,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.rebuildTree()
 				}
 			}
+		case "c":
+			// Collapse all
+			m.collapseAll()
+			m.rebuildTree()
+		case "e":
+			// Expand all
+			m.collapsed = make(map[string]bool)
+			m.rebuildTree()
+		case "1", "2", "3", "4", "5":
+			// Collapse to depth N
+			level := int(msg.String()[0] - '0')
+			m.collapseToDepth(level)
+			m.rebuildTree()
 		case "tab":
 			m.detScroll++
 		case "shift+tab":
@@ -225,6 +248,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, m.startDeepScan(nodeID)
 				}
 			}
+		case "w":
+			// Subnet sweep from selected IP node
+			if m.cursor >= len(m.flatTree) {
+				break
+			}
+			nodeID := m.flatTree[m.cursor]
+			node, ok := m.graph.GetNode(nodeID)
+			if !ok {
+				break
+			}
+			if node.Type != model.NodeTypeIP {
+				m.statusMsg = StyleWarning.Render("⚠ ") + StyleValue.Render("Select an ") +
+					StyleNodeIP.Render("● IP") + StyleValue.Render(" node to sweep its /24 subnet")
+				break
+			}
+			// Abort current scan if running, then start sweep
+			if m.scanning && m.cancelScan != nil {
+				m.cancelScan()
+				m.scanning = false
+			}
+			return m, m.startSubnetSweep(nodeID, node.Address)
 		case "t":
 			// Switch to topology graph view
 			m.mode = viewGraph
@@ -321,6 +365,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case deepScanDoneMsg:
 		m.deepScanning = false
 		m.deepNodeID = ""
+
+	case subnetSweepDoneMsg:
+		m.scanning = false
+		m.statusMsg = StyleSuccess.Render("◎") + fmt.Sprintf(" Subnet sweep complete — %s (%d total nodes)", msg.cidr, msg.found)
+		m.sound.Play(SoundScanComplete)
+		m.rebuildTree()
 
 	case savedMsg:
 		if msg.err != nil {
@@ -452,6 +502,31 @@ func (m *Model) startDeepScan(nodeID string) tea.Cmd {
 	}
 }
 
+func (m *Model) startSubnetSweep(parentNodeID string, address string) tea.Cmd {
+	// Infer /24 from the IP address
+	parts := strings.Split(address, ".")
+	if len(parts) != 4 {
+		m.statusMsg = StyleError.Render("Cannot sweep: not an IPv4 address")
+		return nil
+	}
+	cidr := parts[0] + "." + parts[1] + "." + parts[2] + ".0/24"
+
+	m.scanning = true
+	m.statusMsg = StyleSpinner.Render("◎") + " Sweeping " + StyleNodeIP.Render(cidr) + "..."
+
+	s := m.scanner
+	timeout := m.config.Timeout
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		// Run subnet scan, which adds nodes to the existing graph
+		scanner.SubnetSweepInline(ctx, s, parentNodeID, cidr)
+
+		return subnetSweepDoneMsg{cidr: cidr, found: s.Graph.NodeCount()}
+	}
+}
+
 func (m *Model) syncSelectedID() {
 	if m.cursor >= 0 && m.cursor < len(m.flatTree) {
 		m.selectedID = m.flatTree[m.cursor]
@@ -544,6 +619,26 @@ func (m *Model) treeViewHeight() int {
 	return max(m.height-12, 5)
 }
 
+// collapseAll collapses every node that has children.
+func (m *Model) collapseAll() {
+	nodes, _ := m.graph.Snapshot()
+	for id, n := range nodes {
+		if len(n.Children) > 0 {
+			m.collapsed[id] = true
+		}
+	}
+}
+
+// collapseToDepth collapses nodes at or beyond the given depth.
+func (m *Model) collapseToDepth(level int) {
+	nodes, _ := m.graph.Snapshot()
+	for id, n := range nodes {
+		if len(n.Children) > 0 {
+			m.collapsed[id] = n.Depth >= level
+		}
+	}
+}
+
 func (m *Model) rebuildTree() {
 	m.flatTree = nil
 	if m.graph.Root == "" {
@@ -585,7 +680,7 @@ func (m Model) View() string {
 
 	// Fixed height for the main content area — prevents bouncing
 	headerHeight := 9 // logo + scan info + blank line
-	statusHeight := 1
+	statusHeight := 4 // command bar (2 lines) + status line + separator
 	mainHeight := max(m.height-headerHeight-statusHeight, 10)
 
 	if m.mode == viewGraph {
@@ -645,6 +740,9 @@ func (m Model) renderHelp() string {
 		helpLine("g", "Jump to top"),
 		helpLine("G", "Jump to bottom"),
 		helpLine("enter/space", "Expand/collapse node"),
+		helpLine("c", "Collapse all"),
+		helpLine("e", "Expand all"),
+		helpLine("1-5", "Collapse to depth N"),
 		helpLine("tab", "Scroll detail panel down"),
 		helpLine("shift+tab", "Scroll detail panel up"),
 		"",
@@ -656,6 +754,7 @@ func (m Model) renderHelp() string {
 		StyleSubtitle.Render("  Actions"),
 		divider,
 		helpLine("d", "Deep scan selected node"),
+		helpLine("w", "Subnet sweep selected IP (/24)"),
 		helpLine("m", "Toggle sound effects"),
 		helpLine("n", "New target (enter address)"),
 		helpLine("esc", "Abort running scan"),
@@ -1051,48 +1150,67 @@ func (m Model) renderStatusBar() string {
 		cursor := StyleCyan.Render("█")
 		input := StyleValue.Render(m.inputBuffer) + cursor
 		hint := StyleDim.Render("  (enter to scan, esc to cancel)")
-		return prompt + input + hint
+		return "\n" + prompt + input + hint
 	}
 
-	left := StyleStatusBar.Render(m.statusMsg)
+	// Command reference bar (top line)
+	cmdBar := m.renderCommandBar()
 
+	// Status line (bottom line)
 	nodeCount := fmt.Sprintf("%d nodes", m.graph.NodeCount())
 	elapsed := time.Since(m.startTime).Round(time.Second).String()
 
-	// Watch mode countdown
 	watchInfo := ""
 	if m.WatchMode && !m.watchNext.IsZero() && !m.scanning {
 		remaining := time.Until(m.watchNext).Round(time.Second)
 		if remaining > 0 {
-			watchInfo = fmt.Sprintf("│ rescan in %s ", remaining)
+			watchInfo = fmt.Sprintf(" │ rescan in %s", remaining)
 		}
 	}
 
-	var hints string
-	if m.mode == viewGraph {
-		hints = "t return to tree │ ? help │ q quit"
-	} else if m.mode == viewPath {
-		hints = "◄► traverse │ ↑↓ scroll detail │ d deep │ v tree view │ ? help │ q quit"
-	} else if m.scanning {
-		hints = "↑↓ navigate │ esc abort │ ? help │ q quit"
-	} else if m.deepScanning {
-		hints = "↑↓ navigate │ v path │ ? help │ q quit"
-	} else if m.WatchMode {
-		hints = "↑↓ nav │ enter fold │ d deep │ v path │ s save │ ? help │ q quit"
-	} else {
-		hints = "↑↓ nav │ enter fold │ d deep │ v path │ t topo │ n new │ r rescan │ s save │ ? help │ q quit"
-	}
-
-	_ = watchInfo
-
-	right := StyleDim.Render(fmt.Sprintf("%s │ %s %s│ %s", nodeCount, elapsed, watchInfo, hints))
+	left := StyleStatusBar.Render(m.statusMsg)
+	right := StyleDim.Render(fmt.Sprintf("%s │ %s%s", nodeCount, elapsed, watchInfo))
 
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 0 {
 		gap = 0
 	}
 
-	return left + strings.Repeat(" ", gap) + right
+	statusLine := left + strings.Repeat(" ", gap) + right
+
+	return cmdBar + "\n" + statusLine
+}
+
+func cmdKey(key, label string) string {
+	return StyleCyan.Render(key) + StyleDim.Render(":") + StyleValue.Render(label)
+}
+
+func (m Model) renderCommandBar() string {
+	sep := StyleDim.Render(" │ ")
+
+	row1 := " " + strings.Join([]string{
+		cmdKey("↑↓", "navigate"),
+		cmdKey("enter", "fold"),
+		cmdKey("c", "collapse"),
+		cmdKey("e", "expand"),
+		cmdKey("1-5", "depth"),
+		cmdKey("d", "deep scan"),
+		cmdKey("w", "sweep /24"),
+		cmdKey("esc", "abort"),
+	}, sep)
+
+	row2 := " " + strings.Join([]string{
+		cmdKey("v", "path"),
+		cmdKey("t", "topology"),
+		cmdKey("n", "new target"),
+		cmdKey("r", "rescan"),
+		cmdKey("s", "save"),
+		cmdKey("m", "sound"),
+		cmdKey("?", "help"),
+		cmdKey("q", "quit"),
+	}, sep)
+
+	return row1 + "\n" + row2
 }
 
 func max(a, b int) int {

@@ -137,6 +137,73 @@ func SubnetScan(ctx context.Context, s *Scanner, cidr string) error {
 	return nil
 }
 
+// SubnetSweepInline runs a subnet sweep and attaches discovered hosts as
+// children of an existing node in the graph. Used when triggering a sweep
+// from within the TUI on a selected IP node.
+func SubnetSweepInline(ctx context.Context, s *Scanner, parentNodeID string, cidr string) {
+	ips, err := ExpandCIDR(cidr)
+	if err != nil {
+		return
+	}
+
+	parentNode, ok := s.Graph.GetNode(parentNodeID)
+	if !ok {
+		return
+	}
+	parentDepth := parentNode.Depth
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 50)
+
+	for _, ip := range ips {
+		if ctx.Err() != nil {
+			break
+		}
+
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			if isAlive(ctx, addr) {
+				nodeID := model.NodeID(model.NodeTypeIP, addr)
+				if s.Graph.HasNode(nodeID) {
+					return // already discovered
+				}
+				node := &model.Node{
+					ID:      nodeID,
+					Label:   addr,
+					Type:    model.NodeTypeIP,
+					Address: addr,
+					Depth:   parentDepth + 1,
+					Parent:  parentNodeID,
+				}
+				s.Graph.AddNode(node)
+				s.Graph.AddEdge(model.Edge{
+					From:  parentNodeID,
+					To:    nodeID,
+					Type:  model.EdgeTypeRoute,
+					Label: "subnet",
+				})
+				s.emit(model.EventNodeAdded, nodeID, "Host alive: "+addr)
+
+				// Reverse DNS
+				names, err := net.LookupAddr(addr)
+				if err == nil && len(names) > 0 {
+					s.Graph.UpdateProbe(nodeID, "dns", model.ProbeResult{
+						Type:   "dns",
+						Status: model.ProbeStatusSuccess,
+						Data:   map[string]string{"reverse_dns": names[0]},
+					})
+				}
+			}
+		}(ip.String())
+	}
+
+	wg.Wait()
+}
+
 // isAlive does a quick TCP connect or ping check.
 func isAlive(ctx context.Context, addr string) bool {
 	// Try TCP connect on common ports first (faster than ICMP which needs privileges)

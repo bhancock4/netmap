@@ -48,7 +48,6 @@ func (s *Scanner) Run(ctx context.Context) {
 			s.Config.Target = target
 			SubnetScan(ctx, s, target)
 			s.emit(model.EventScanDone, "", "Subnet scan complete")
-			close(s.Events)
 			return
 		}
 	}
@@ -79,7 +78,6 @@ func (s *Scanner) Run(ctx context.Context) {
 	s.probeNode(ctx, rootID, target, isIP, 0)
 
 	s.emit(model.EventScanDone, rootID, "Scan complete")
-	close(s.Events)
 }
 
 // DeepScan runs an in-depth scan on a specific node.
@@ -264,17 +262,13 @@ func (s *Scanner) release() {
 }
 
 func (s *Scanner) emit(eventType, nodeID, message string) {
+	// Recover from sending on a closed channel (can happen when
+	// subnet sweep or deep scan reuses a scanner whose Run() already
+	// closed the channel).
+	defer func() { recover() }()
+
 	select {
 	case s.Events <- Event{Type: eventType, NodeID: nodeID, Message: message}:
 	default:
-		// channel full — drop oldest event to make room
-		select {
-		case <-s.Events:
-		default:
-		}
-		select {
-		case s.Events <- Event{Type: eventType, NodeID: nodeID, Message: message}:
-		default:
-		}
 	}
 }
